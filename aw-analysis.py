@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import json
+import socket
 import sys
 import urllib.error
 import urllib.parse
@@ -70,24 +71,45 @@ def discover_buckets(base_url):
     return dict(buckets)
 
 
+def get_local_hostname():
+    """Get the local hostname as ActivityWatch would see it."""
+    hostname = socket.gethostname()
+    # AW typically uses the full hostname (e.g., "Air4.local" on macOS)
+    if "." not in hostname:
+        # Try to get the FQDN
+        fqdn = socket.getfqdn()
+        if fqdn and fqdn != hostname:
+            hostname = fqdn
+    return hostname
+
+
 def pick_bucket(buckets, btype, hostname=None):
     """Pick the best bucket for a given type.
 
-    Prefers buckets matching the given hostname. If no hostname specified,
-    picks the one with the most recent-looking ID (alphabetically last,
-    which tends to be the current hostname).
+    Priority: 1) explicit --hostname match, 2) local hostname match,
+    3) first candidate (fallback).
     """
     candidates = buckets.get(btype, [])
     if not candidates:
         return None
 
+    # 1. Explicit hostname override
     if hostname:
         for b in candidates:
             if hostname.lower() in b["id"].lower():
                 return b["id"]
 
-    # Fall back to alphabetically last (often the current hostname)
-    return sorted(candidates, key=lambda b: b["id"])[-1]["id"]
+    # 2. Match local machine hostname
+    local_host = get_local_hostname()
+    for b in candidates:
+        if local_host.lower() in b["id"].lower():
+            return b["id"]
+
+    # 3. Fall back: prefer candidates with known hostnames over "unknown"
+    known = [b for b in candidates if b["hostname"] != "unknown"]
+    if known:
+        return known[0]["id"]
+    return candidates[0]["id"]
 
 
 def fetch_events(base_url, bucket_id, start, end, limit=10000):
