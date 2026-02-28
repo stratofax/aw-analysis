@@ -36,13 +36,21 @@ TYPE_BROWSER = "web.tab.current"
 TYPE_EDITOR = "app.editor.activity"
 
 
-def fetch_json(url):
+def fetch_json(url, timeout=30):
     """Fetch JSON from a URL, return parsed data or None on error."""
     try:
-        resp = urllib.request.urlopen(url, timeout=10)
+        resp = urllib.request.urlopen(url, timeout=timeout)
         return json.loads(resp.read())
-    except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
-        print(f"  Warning: could not fetch {url}: {e}", file=sys.stderr)
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        print(f"  Error: could not connect — {reason}", file=sys.stderr)
+        print(f"  Is ActivityWatch running? URL: {url}", file=sys.stderr)
+        return None
+    except json.JSONDecodeError as e:
+        print(f"  Error: invalid JSON response from {url}: {e}", file=sys.stderr)
+        return None
+    except OSError as e:
+        print(f"  Error: {e}", file=sys.stderr)
         return None
 
 
@@ -83,6 +91,23 @@ def get_local_hostname():
     return hostname
 
 
+def _hostname_matches(bucket_id, hostname):
+    """Check if a bucket ID ends with the given hostname (after _ or - delimiter).
+
+    Uses suffix matching on AW's bucket naming convention:
+    'aw-watcher-window_MyHost.local' -> matches 'MyHost.local'
+    Prevents 'air' from matching 'air4' (substring false positive).
+    """
+    bid = bucket_id.lower()
+    host = hostname.lower()
+    # Exact match on the suffix after the last underscore or hyphen-delimited segment
+    for sep in ("_", "-"):
+        idx = bid.rfind(sep)
+        if idx >= 0 and bid[idx + 1:] == host:
+            return True
+    return False
+
+
 def pick_bucket(buckets, btype, hostname=None):
     """Pick the best bucket for a given type.
 
@@ -96,13 +121,13 @@ def pick_bucket(buckets, btype, hostname=None):
     # 1. Explicit hostname override
     if hostname:
         for b in candidates:
-            if hostname.lower() in b["id"].lower():
+            if _hostname_matches(b["id"], hostname):
                 return b["id"]
 
     # 2. Match local machine hostname
     local_host = get_local_hostname()
     for b in candidates:
-        if local_host.lower() in b["id"].lower():
+        if _hostname_matches(b["id"], local_host):
             return b["id"]
 
     # 3. Fall back: prefer candidates with known hostnames over "unknown"
@@ -113,14 +138,25 @@ def pick_bucket(buckets, btype, hostname=None):
 
 
 def fetch_events(base_url, bucket_id, start, end, limit=10000):
-    """Fetch events from a bucket within a time range."""
+    """Fetch events from a bucket within a time range.
+
+    Warns on stderr if the number of returned events equals the limit,
+    which indicates the results may be truncated.
+    """
     start_str = urllib.parse.quote(start.isoformat())
     end_str = urllib.parse.quote(end.isoformat())
     url = (
         f"{base_url}/api/0/buckets/{bucket_id}/events"
         f"?limit={limit}&start={start_str}&end={end_str}"
     )
-    return fetch_json(url) or []
+    events = fetch_json(url) or []
+    if len(events) == limit:
+        print(
+            f"  Warning: {limit} events returned from {bucket_id} — "
+            f"results may be incomplete. Try a shorter time range.",
+            file=sys.stderr,
+        )
+    return events
 
 
 def parse_timestamp(ts_str):
@@ -139,6 +175,25 @@ def parse_timestamp(ts_str):
         return datetime.fromisoformat(f"{base}{tz}")
 
 
+def _merge_intervals(intervals):
+    """Merge overlapping or adjacent time intervals.
+
+    Takes a sorted list of (start, end) tuples and returns a new list
+    with overlapping intervals merged. O(n) after sort.
+    """
+    if not intervals:
+        return []
+    merged = [intervals[0]]
+    for start, end in intervals[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            # Overlapping or adjacent — extend
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def compute_active_time(window_events, afk_events):
     """Intersect window events with not-afk intervals.
 
@@ -155,8 +210,10 @@ def compute_active_time(window_events, afk_events):
             end = start + timedelta(seconds=duration)
             not_afk.append((start, end))
 
-    # Sort by start time
+    # Sort by start time and merge overlapping intervals to prevent
+    # double-counting when the AFK watcher produces duplicate events
     not_afk.sort(key=lambda x: x[0])
+    not_afk = _merge_intervals(not_afk)
 
     # Intersect each window event with not-afk intervals
     active = []
@@ -193,8 +250,9 @@ def categorize_browser(browser_events, start, end):
         data = e.get("data", {})
         url = data.get("url", "")
         duration = e.get("duration", 0)
-        if "://" in url:
-            domain = url.split("://")[1].split("/")[0]
+        parsed = urllib.parse.urlparse(url)
+        domain = parsed.hostname
+        if domain:
             # Strip www. for cleaner grouping
             if domain.startswith("www."):
                 domain = domain[4:]
@@ -218,18 +276,20 @@ def categorize_editor(editor_events, start, end):
 
         files[filepath] += duration
 
-        # Categorize by path components
-        parts = filepath.lower().split("/")
-        if "diary" in parts or "journal" in parts:
-            categories["writing/diary"] += duration
-        elif "pages" in parts:
-            categories["writing/pages"] += duration
-        elif "projects" in parts:
-            categories["project-mgmt"] += duration
-        elif "tasks" in parts or "todo" in parts:
-            categories["task-mgmt"] += duration
-        elif "notes" in parts:
-            categories["notes"] += duration
+        # Categorize by file extension (cross-platform)
+        # Normalize path separators for Windows compatibility
+        normalized = filepath.replace("\\", "/").lower()
+        ext = normalized.rsplit(".", 1)[-1] if "." in normalized else ""
+        if ext in ("md", "txt", "rst", "adoc", "org"):
+            categories["writing"] += duration
+        elif ext in ("py", "js", "ts", "tsx", "jsx", "rs", "go", "java",
+                      "c", "cpp", "h", "rb", "sh", "bash", "zsh"):
+            categories["code"] += duration
+        elif ext in ("json", "yaml", "yml", "toml", "ini", "cfg", "conf",
+                      "xml", "env"):
+            categories["config"] += duration
+        elif ext in ("html", "css", "scss", "less", "svelte", "vue"):
+            categories["web"] += duration
         else:
             categories["other"] += duration
 
@@ -391,12 +451,18 @@ def main():
     if args.start or args.end:
         if not args.start or not args.end:
             parser.error("--start and --end must both be specified")
-        start = datetime.fromisoformat(args.start).replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=local_tz
-        )
-        end = datetime.fromisoformat(args.end).replace(
-            hour=23, minute=59, second=59, microsecond=999999, tzinfo=local_tz
-        )
+        try:
+            start = datetime.strptime(args.start, "%Y-%m-%d").replace(
+                tzinfo=local_tz
+            )
+        except ValueError:
+            parser.error(f"Invalid start date: '{args.start}'. Expected format: YYYY-MM-DD")
+        try:
+            end = datetime.strptime(args.end, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, microsecond=999999, tzinfo=local_tz
+            )
+        except ValueError:
+            parser.error(f"Invalid end date: '{args.end}'. Expected format: YYYY-MM-DD")
     else:
         start, end = get_period_range(args.period)
 
@@ -437,12 +503,28 @@ def main():
         print(f"  Window events: {len(window_events)}")
         print(f"  AFK events: {len(afk_events)}")
 
-    # Compute AFK summary
+    if not window_events:
+        msg = (f"No window events found for "
+               f"{start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}.")
+        if args.json_output:
+            print(json.dumps({"error": msg}))
+        else:
+            print(f"\n  {msg}")
+        sys.exit(0)
+
+    # Compute AFK summary (clipped to requested time range)
     active_secs = 0
     afk_secs = 0
     for e in afk_events:
         status = e.get("data", {}).get("status", "")
-        duration = e.get("duration", 0)
+        e_start = parse_timestamp(e["timestamp"])
+        e_end = e_start + timedelta(seconds=e.get("duration", 0))
+        # Clip to requested range
+        clipped_start = max(e_start, start)
+        clipped_end = min(e_end, end)
+        if clipped_start >= clipped_end:
+            continue
+        duration = (clipped_end - clipped_start).total_seconds()
         if status == "not-afk":
             active_secs += duration
         elif status == "afk":
