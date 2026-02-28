@@ -9,7 +9,7 @@ ActivityWatch tracks which app is in the foreground and whether the user is acti
 - **AFK-filtered active time** — only counts time when you were actually at the keyboard
 - **App breakdown** — active time per application with visual bars
 - **Browser detail** — breaks down browser time by domain (requires the [ActivityWatch web extension](https://docs.activitywatch.net/en/latest/getting-started.html))
-- **Editor detail** — categorizes editor time by file path (supports Obsidian, VS Code, and other editor watchers)
+- **Editor detail** — categorizes editor time by file extension (`.md` → writing, `.py` → code, `.yaml` → config, etc.)
 - **Flexible time ranges** — daily, weekly, monthly, or arbitrary date ranges
 - **Auto-discovery** — finds the right buckets automatically, no configuration needed
 - **Zero dependencies** — Python 3.7+ stdlib only, runs anywhere Python does
@@ -79,13 +79,13 @@ The result is **actual active time** — only the time you were at the keyboard 
 
 For browser apps, the tool cross-references the `web.tab.current` bucket to break down time by domain (e.g., `github.com`, `mail.google.com`, `reddit.com`).
 
-For editor apps, it cross-references the `app.editor.activity` bucket to categorize time by file path (writing, notes, project management, etc.).
+For editor apps, it cross-references the `app.editor.activity` bucket to categorize time by file extension (`.md`/`.txt` → writing, `.py`/`.js` → code, `.yaml`/`.json` → config, `.html`/`.css` → web).
 
 ## Bucket Auto-Discovery
 
 The script queries `/api/0/buckets/` and picks buckets by type, not by hardcoded name. This means it works regardless of your hostname, machine name changes, or synced data from other machines.
 
-If multiple buckets of the same type exist, it picks the alphabetically last one (which tends to be the current hostname). You can override this with `--hostname`.
+If multiple buckets of the same type exist, it matches against the local machine's hostname using AW's `bucket_type_hostname` naming convention. You can override this with `--hostname`.
 
 ## Multi-Machine Usage
 
@@ -96,6 +96,22 @@ Install and run separately on each machine. Each instance analyzes its own local
 - **ActivityWatch:** v0.12+ (tested on v0.13.2)
 - **Python:** 3.7+
 - **Platforms:** macOS, Linux, Windows — anywhere ActivityWatch and Python run
+
+## Testing
+
+```bash
+# Install test dependencies
+python3 -m venv .venv
+.venv/bin/pip install pytest pytest-cov
+
+# Run tests
+.venv/bin/pytest test_aw_analysis.py -v
+
+# Run with coverage
+.venv/bin/pytest test_aw_analysis.py --cov=. --cov-report=term-missing
+```
+
+91 tests, 97% coverage. All tests mock the AW API — no running ActivityWatch instance needed.
 
 ## License
 
