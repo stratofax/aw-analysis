@@ -4,9 +4,9 @@ aw-analysis — ActivityWatch time analysis with AFK-filtered active time.
 
 Analyzes ActivityWatch data by intersecting window events with not-afk
 intervals to compute accurate active time. Supports daily, weekly, monthly,
-and arbitrary date ranges.
+and arbitrary date ranges. Multi-device support via SSH tunnels.
 
-Requires: Python 3.7+, ActivityWatch running on localhost (or specify --port).
+Requires: Python 3.7+, ActivityWatch running (local or remote via --host).
 No external dependencies — stdlib only.
 
 Usage:
@@ -15,10 +15,15 @@ Usage:
     aw-analysis.py --period month         # This month
     aw-analysis.py --start 2026-02-22 --end 2026-02-28  # Custom range
     aw-analysis.py --json                 # Machine-readable output
+    aw-analysis.py --host localhost --port 5601  # Remote server via SSH tunnel
+    aw-analysis.py --hostname "Host1,Host2"      # Multi-hostname consolidation
+    aw-analysis.py --export-dir ./data --start 2026-02-01 --end 2026-02-28
+    aw-analysis.py --devices "localhost:5600,localhost:5601"  # Multi-device
 """
 
 import argparse
 import json
+import os
 import socket
 import sys
 import urllib.error
@@ -27,7 +32,7 @@ import urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # AW bucket type constants
 TYPE_WINDOW = "currentwindow"
@@ -100,11 +105,11 @@ def _hostname_matches(bucket_id, hostname):
     """
     bid = bucket_id.lower()
     host = hostname.lower()
-    # Exact match on the suffix after the last underscore or hyphen-delimited segment
-    for sep in ("_", "-"):
-        idx = bid.rfind(sep)
-        if idx >= 0 and bid[idx + 1:] == host:
-            return True
+    # AW convention: hostname is after underscore (e.g., aw-watcher-window_MyHost)
+    # Hyphens are part of the watcher name, NOT hostname delimiters
+    idx = bid.rfind("_")
+    if idx >= 0 and bid[idx + 1:] == host:
+        return True
     return False
 
 
@@ -409,6 +414,277 @@ def print_summary(results, args):
     print(f"{'=' * 60}\n")
 
 
+def pick_buckets_multi(buckets, btype, hostnames):
+    """Pick all buckets matching any of the given hostnames for a type.
+
+    Returns list of bucket IDs. Used for multi-hostname consolidation.
+    """
+    candidates = buckets.get(btype, [])
+    if not candidates:
+        return []
+    matched = []
+    for hostname in hostnames:
+        for b in candidates:
+            if _hostname_matches(b["id"], hostname) and b["id"] not in matched:
+                matched.append(b["id"])
+    return matched
+
+
+def fetch_events_multi(base_url, bucket_ids, start, end, limit=10000):
+    """Fetch and merge events from multiple buckets."""
+    all_events = []
+    for bid in bucket_ids:
+        all_events.extend(fetch_events(base_url, bid, start, end, limit))
+    return all_events
+
+
+def analyze_range(base_url, start, end, hostname=None, quiet=True):
+    """Analyze a time range on a single AW server.
+
+    Returns a results dict, or None if no window events found.
+    When hostname is a comma-separated string, uses multi-hostname matching.
+    """
+    buckets = discover_buckets(base_url)
+
+    if not quiet:
+        total = sum(len(v) for v in buckets.values())
+        print(f"Found {total} relevant buckets across {len(buckets)} types")
+
+    # Multi-hostname support: comma-separated values
+    hostnames = None
+    if hostname and "," in hostname:
+        hostnames = [h.strip() for h in hostname.split(",")]
+
+    # Pick buckets — multi or single
+    if hostnames:
+        window_ids = pick_buckets_multi(buckets, TYPE_WINDOW, hostnames)
+        afk_ids = pick_buckets_multi(buckets, TYPE_AFK, hostnames)
+        browser_ids = pick_buckets_multi(buckets, TYPE_BROWSER, hostnames)
+        editor_ids = pick_buckets_multi(buckets, TYPE_EDITOR, hostnames)
+
+        if not window_ids or not afk_ids:
+            print("Error: could not find window and AFK buckets.", file=sys.stderr)
+            return None
+
+        buckets_used = window_ids + afk_ids
+        window_events = fetch_events_multi(base_url, window_ids, start, end)
+        afk_events = fetch_events_multi(base_url, afk_ids, start, end)
+
+        if not window_events:
+            return None
+
+        browser_domains = {}
+        if browser_ids:
+            buckets_used.extend(browser_ids)
+            browser_events = fetch_events_multi(
+                base_url, browser_ids, start, end
+            )
+            browser_domains = categorize_browser(browser_events, start, end)
+
+        editor_categories = {}
+        editor_files = {}
+        if editor_ids:
+            buckets_used.extend(editor_ids)
+            editor_events = fetch_events_multi(
+                base_url, editor_ids, start, end
+            )
+            editor_categories, editor_files = categorize_editor(
+                editor_events, start, end
+            )
+
+        resolved_hostname = hostnames[0]
+    else:
+        window_id = pick_bucket(buckets, TYPE_WINDOW, hostname)
+        afk_id = pick_bucket(buckets, TYPE_AFK, hostname)
+        browser_id = pick_bucket(buckets, TYPE_BROWSER, hostname)
+        editor_id = pick_bucket(buckets, TYPE_EDITOR, hostname)
+
+        if not window_id or not afk_id:
+            print("Error: could not find window and AFK buckets.", file=sys.stderr)
+            print("Available buckets:", file=sys.stderr)
+            for btype, blist in buckets.items():
+                for b in blist:
+                    print(f"  [{btype}] {b['id']}", file=sys.stderr)
+            sys.exit(1)
+
+        buckets_used = [window_id, afk_id]
+        window_events = fetch_events(base_url, window_id, start, end)
+        afk_events = fetch_events(base_url, afk_id, start, end)
+
+        if not quiet:
+            print(f"  Window events: {len(window_events)}")
+            print(f"  AFK events: {len(afk_events)}")
+
+        if not window_events:
+            return None
+
+        browser_domains = {}
+        if browser_id:
+            buckets_used.append(browser_id)
+            browser_events = fetch_events(base_url, browser_id, start, end)
+            if not quiet:
+                print(f"  Browser events: {len(browser_events)}")
+            browser_domains = categorize_browser(browser_events, start, end)
+
+        editor_categories = {}
+        editor_files = {}
+        if editor_id:
+            buckets_used.append(editor_id)
+            editor_events = fetch_events(base_url, editor_id, start, end)
+            if not quiet:
+                print(f"  Editor events: {len(editor_events)}")
+            editor_categories, editor_files = categorize_editor(
+                editor_events, start, end
+            )
+
+        # Determine hostname from the window bucket
+        resolved_hostname = "unknown"
+        for b in buckets.get(TYPE_WINDOW, []):
+            if b["id"] == window_id:
+                resolved_hostname = b["hostname"]
+                break
+
+    # Compute AFK summary (clipped to requested time range)
+    active_secs = 0
+    afk_secs = 0
+    for e in afk_events:
+        status = e.get("data", {}).get("status", "")
+        e_start = parse_timestamp(e["timestamp"])
+        e_end = e_start + timedelta(seconds=e.get("duration", 0))
+        clipped_start = max(e_start, start)
+        clipped_end = min(e_end, end)
+        if clipped_start >= clipped_end:
+            continue
+        duration = (clipped_end - clipped_start).total_seconds()
+        if status == "not-afk":
+            active_secs += duration
+        elif status == "afk":
+            afk_secs += duration
+
+    # Compute active time by app (AFK-filtered)
+    active_events = compute_active_time(window_events, afk_events)
+    active_by_app = defaultdict(float)
+    for app, title, secs in active_events:
+        active_by_app[app] += secs
+
+    return {
+        "start": start,
+        "end": end,
+        "hostname": resolved_hostname,
+        "buckets_used": buckets_used,
+        "afk_summary": {
+            "active_seconds": active_secs,
+            "afk_seconds": afk_secs,
+            "total_seconds": active_secs + afk_secs,
+            "active_ratio": active_secs / (active_secs + afk_secs)
+            if (active_secs + afk_secs) > 0
+            else 0,
+        },
+        "active_by_app": dict(active_by_app),
+        "browser_domains": browser_domains,
+        "editor_categories": editor_categories,
+        "editor_files": editor_files,
+    }
+
+
+def merge_results(results_list):
+    """Merge multiple analyze_range results into a combined summary.
+
+    Combines active_by_app, browser_domains, editor_categories, editor_files
+    by summing durations. Returns a merged results dict with a 'devices' array.
+    """
+    if not results_list:
+        return None
+
+    combined_apps = defaultdict(float)
+    combined_browser = defaultdict(float)
+    combined_editor_cats = defaultdict(float)
+    combined_editor_files = defaultdict(float)
+    combined_active = 0
+    combined_afk = 0
+    all_buckets = []
+    devices = []
+
+    for r in results_list:
+        for app, secs in r.get("active_by_app", {}).items():
+            combined_apps[app] += secs
+        for domain, secs in r.get("browser_domains", {}).items():
+            combined_browser[domain] += secs
+        for cat, secs in r.get("editor_categories", {}).items():
+            combined_editor_cats[cat] += secs
+        for f, secs in r.get("editor_files", {}).items():
+            combined_editor_files[f] += secs
+        afk = r.get("afk_summary", {})
+        combined_active += afk.get("active_seconds", 0)
+        combined_afk += afk.get("afk_seconds", 0)
+        all_buckets.extend(r.get("buckets_used", []))
+        devices.append({
+            "hostname": r.get("hostname", "unknown"),
+            "active_seconds": afk.get("active_seconds", 0),
+            "afk_seconds": afk.get("afk_seconds", 0),
+            "buckets_used": r.get("buckets_used", []),
+        })
+
+    total = combined_active + combined_afk
+    return {
+        "start": results_list[0]["start"],
+        "end": results_list[0]["end"],
+        "hostname": "multi-device",
+        "buckets_used": all_buckets,
+        "afk_summary": {
+            "active_seconds": combined_active,
+            "afk_seconds": combined_afk,
+            "total_seconds": total,
+            "active_ratio": combined_active / total if total > 0 else 0,
+        },
+        "active_by_app": dict(combined_apps),
+        "browser_domains": dict(combined_browser),
+        "editor_categories": dict(combined_editor_cats),
+        "editor_files": dict(combined_editor_files),
+        "devices": devices,
+    }
+
+
+def export_days(base_url, start, end, export_dir, hostname=None):
+    """Export day-by-day JSON files to a directory.
+
+    Creates one YYYY-MM-DD.json per day. Skips empty days.
+    Returns count of files written.
+    """
+    os.makedirs(export_dir, exist_ok=True)
+
+    local_tz = start.tzinfo
+    current = start
+    written = 0
+
+    while current < end:
+        day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = current.replace(
+            hour=23, minute=59, second=59, microsecond=999999
+        )
+        date_str = current.strftime("%Y-%m-%d")
+
+        print(f"  {date_str}...", end=" ", flush=True)
+        results = analyze_range(base_url, day_start, day_end, hostname)
+
+        if results is None:
+            print("no data, skipping")
+        else:
+            output = dict(results)
+            output["start"] = results["start"].isoformat()
+            output["end"] = results["end"].isoformat()
+            filepath = os.path.join(export_dir, f"{date_str}.json")
+            with open(filepath, "w") as f:
+                json.dump(output, f, indent=2)
+            active = results["afk_summary"]["active_seconds"]
+            print(f"wrote {filepath} ({format_duration(active)} active)")
+            written += 1
+
+        current += timedelta(days=1)
+
+    return written
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze ActivityWatch data with AFK-filtered active time.",
@@ -428,23 +704,45 @@ def main():
         help="End date (YYYY-MM-DD). Overrides --period.",
     )
     parser.add_argument(
+        "--host", type=str, default="localhost",
+        help="ActivityWatch server host (default: localhost)",
+    )
+    parser.add_argument(
         "--port", type=int, default=5600,
         help="ActivityWatch server port (default: 5600)",
     )
     parser.add_argument(
         "--hostname", type=str, default=None,
-        help="Prefer buckets matching this hostname (auto-detected if omitted)",
+        help="Prefer buckets matching this hostname. Comma-separated for "
+             "multi-hostname consolidation (auto-detected if omitted)",
     )
     parser.add_argument(
         "--json", action="store_true", dest="json_output",
         help="Output machine-readable JSON",
     )
     parser.add_argument(
+        "--export-dir", type=str, default=None, dest="export_dir",
+        help="Export day-by-day JSON files to this directory. "
+             "Requires --start and --end.",
+    )
+    parser.add_argument(
+        "--devices", type=str, default=None,
+        help='Query multiple AW servers: "host:port,host:port". '
+             "Mutually exclusive with --host.",
+    )
+    parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}",
     )
     args = parser.parse_args()
 
-    base_url = f"http://localhost:{args.port}"
+    # Validate mutual exclusivity
+    if args.devices and args.host != "localhost":
+        parser.error("--devices and --host are mutually exclusive")
+
+    # Validate --export-dir requires date range
+    if args.export_dir and (not args.start or not args.end):
+        parser.error("--export-dir requires --start and --end")
+
     local_tz = datetime.now().astimezone().tzinfo
 
     # Determine time range
@@ -466,44 +764,71 @@ def main():
     else:
         start, end = get_period_range(args.period)
 
-    # Discover buckets
+    # Export mode
+    if args.export_dir:
+        base_url = f"http://{args.host}:{args.port}"
+        print(f"Exporting to {args.export_dir}...")
+        written = export_days(base_url, start, end, args.export_dir, args.hostname)
+        print(f"Done: {written} files written to {args.export_dir}")
+        return
+
+    # Multi-device mode
+    if args.devices:
+        device_specs = [d.strip() for d in args.devices.split(",")]
+        results_list = []
+        for spec in device_specs:
+            if ":" in spec:
+                dhost, dport = spec.rsplit(":", 1)
+            else:
+                dhost, dport = spec, "5600"
+            device_url = f"http://{dhost}:{dport}"
+            if not args.json_output:
+                print(f"Querying {device_url}...")
+            try:
+                result = analyze_range(
+                    device_url, start, end, args.hostname,
+                    quiet=args.json_output,
+                )
+                if result:
+                    results_list.append(result)
+                elif not args.json_output:
+                    print(f"  Warning: no data from {device_url}", file=sys.stderr)
+            except SystemExit:
+                print(
+                    f"  Warning: could not connect to {device_url}, skipping",
+                    file=sys.stderr,
+                )
+                continue
+
+        if not results_list:
+            msg = "No data from any device."
+            if args.json_output:
+                print(json.dumps({"error": msg}))
+            else:
+                print(f"\n  {msg}")
+            sys.exit(0)
+
+        merged = merge_results(results_list)
+        if args.json_output:
+            output = dict(merged)
+            output["start"] = merged["start"].isoformat()
+            output["end"] = merged["end"].isoformat()
+            print(json.dumps(output, indent=2))
+        else:
+            print_summary(merged, args)
+        return
+
+    # Single-server mode
+    base_url = f"http://{args.host}:{args.port}"
+
     if not args.json_output:
         print(f"Connecting to ActivityWatch at {base_url}...")
-    buckets = discover_buckets(base_url)
 
-    if not args.json_output:
-        total = sum(len(v) for v in buckets.values())
-        print(f"Found {total} relevant buckets across {len(buckets)} types")
+    results = analyze_range(
+        base_url, start, end, args.hostname, quiet=args.json_output
+    )
 
-    # Pick best buckets for each type
-    window_id = pick_bucket(buckets, TYPE_WINDOW, args.hostname)
-    afk_id = pick_bucket(buckets, TYPE_AFK, args.hostname)
-    browser_id = pick_bucket(buckets, TYPE_BROWSER, args.hostname)
-    editor_id = pick_bucket(buckets, TYPE_EDITOR, args.hostname)
-
-    if not window_id or not afk_id:
-        print("Error: could not find window and AFK buckets.", file=sys.stderr)
-        print("Available buckets:", file=sys.stderr)
-        for btype, blist in buckets.items():
-            for b in blist:
-                print(f"  [{btype}] {b['id']}", file=sys.stderr)
-        sys.exit(1)
-
-    buckets_used = [window_id, afk_id]
-
-    # Fetch core events
-    if not args.json_output:
-        print(f"Fetching events for {start.strftime('%Y-%m-%d')} to "
-              f"{end.strftime('%Y-%m-%d')}...")
-
-    window_events = fetch_events(base_url, window_id, start, end)
-    afk_events = fetch_events(base_url, afk_id, start, end)
-
-    if not args.json_output:
-        print(f"  Window events: {len(window_events)}")
-        print(f"  AFK events: {len(afk_events)}")
-
-    if not window_events:
+    if results is None:
         msg = (f"No window events found for "
                f"{start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}.")
         if args.json_output:
@@ -512,82 +837,10 @@ def main():
             print(f"\n  {msg}")
         sys.exit(0)
 
-    # Compute AFK summary (clipped to requested time range)
-    active_secs = 0
-    afk_secs = 0
-    for e in afk_events:
-        status = e.get("data", {}).get("status", "")
-        e_start = parse_timestamp(e["timestamp"])
-        e_end = e_start + timedelta(seconds=e.get("duration", 0))
-        # Clip to requested range
-        clipped_start = max(e_start, start)
-        clipped_end = min(e_end, end)
-        if clipped_start >= clipped_end:
-            continue
-        duration = (clipped_end - clipped_start).total_seconds()
-        if status == "not-afk":
-            active_secs += duration
-        elif status == "afk":
-            afk_secs += duration
-
-    # Compute active time by app (AFK-filtered)
-    active_events = compute_active_time(window_events, afk_events)
-    active_by_app = defaultdict(float)
-    for app, title, secs in active_events:
-        active_by_app[app] += secs
-
-    # Browser categorization (optional)
-    browser_domains = {}
-    if browser_id:
-        buckets_used.append(browser_id)
-        browser_events = fetch_events(base_url, browser_id, start, end)
-        if not args.json_output:
-            print(f"  Browser events: {len(browser_events)}")
-        browser_domains = categorize_browser(browser_events, start, end)
-
-    # Editor categorization (optional)
-    editor_categories = {}
-    editor_files = {}
-    if editor_id:
-        buckets_used.append(editor_id)
-        editor_events = fetch_events(base_url, editor_id, start, end)
-        if not args.json_output:
-            print(f"  Editor events: {len(editor_events)}")
-        editor_categories, editor_files = categorize_editor(
-            editor_events, start, end
-        )
-
-    # Determine hostname from the window bucket
-    hostname = "unknown"
-    for b in buckets.get(TYPE_WINDOW, []):
-        if b["id"] == window_id:
-            hostname = b["hostname"]
-            break
-
-    results = {
-        "start": start,
-        "end": end,
-        "hostname": hostname,
-        "buckets_used": buckets_used,
-        "afk_summary": {
-            "active_seconds": active_secs,
-            "afk_seconds": afk_secs,
-            "total_seconds": active_secs + afk_secs,
-            "active_ratio": active_secs / (active_secs + afk_secs)
-            if (active_secs + afk_secs) > 0
-            else 0,
-        },
-        "active_by_app": dict(active_by_app),
-        "browser_domains": browser_domains,
-        "editor_categories": editor_categories,
-        "editor_files": editor_files,
-    }
-
     if args.json_output:
-        # Serialize with datetime conversion
         output = dict(results)
-        output["start"] = start.isoformat()
-        output["end"] = end.isoformat()
+        output["start"] = results["start"].isoformat()
+        output["end"] = results["end"].isoformat()
         print(json.dumps(output, indent=2))
     else:
         print_summary(results, args)

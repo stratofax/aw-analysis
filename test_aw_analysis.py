@@ -527,7 +527,7 @@ class TestMain:
             aw.main()
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
-        assert "0.1.0" in out
+        assert "0.2.0" in out
 
     @patch.object(aw, "fetch_json")
     def test_date_validation_bad_start(self, mock_fetch):
@@ -821,3 +821,628 @@ class TestPrintSummary:
         aw.print_summary(results, MagicMock(json_output=False))
         out = capsys.readouterr().out
         assert "ActivityWatch Analysis" in out
+
+
+# ── --host flag ──────────────────────────────────────────────────────
+
+
+class TestHostFlag:
+    @patch.object(aw, "get_local_hostname", return_value="Host")
+    @patch.object(aw, "fetch_json")
+    def test_host_default_localhost(self, mock_fetch, mock_host, capsys):
+        """Default --host is localhost."""
+        buckets_response = {
+            "aw-watcher-window_Host": {
+                "type": "currentwindow", "hostname": "Host", "client": "c",
+            },
+            "aw-watcher-afk_Host": {
+                "type": "afkstatus", "hostname": "Host", "client": "c",
+            },
+        }
+        mock_fetch.side_effect = [
+            buckets_response,
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        sys.argv = ["aw-analysis.py", "--start", "2026-02-28", "--end", "2026-02-28"]
+        aw.main()
+        out = capsys.readouterr().out
+        assert "localhost" in out
+
+    @patch.object(aw, "get_local_hostname", return_value="Host")
+    @patch.object(aw, "fetch_json")
+    def test_host_custom(self, mock_fetch, mock_host, capsys):
+        """--host uses custom hostname in URL."""
+        buckets_response = {
+            "aw-watcher-window_Host": {
+                "type": "currentwindow", "hostname": "Host", "client": "c",
+            },
+            "aw-watcher-afk_Host": {
+                "type": "afkstatus", "hostname": "Host", "client": "c",
+            },
+        }
+        mock_fetch.side_effect = [
+            buckets_response,
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        sys.argv = [
+            "aw-analysis.py", "--host", "myremote",
+            "--start", "2026-02-28", "--end", "2026-02-28",
+        ]
+        aw.main()
+        out = capsys.readouterr().out
+        assert "myremote" in out
+
+    @patch.object(aw, "get_local_hostname", return_value="Host")
+    @patch.object(aw, "fetch_json")
+    def test_host_with_port(self, mock_fetch, mock_host, capsys):
+        """--host combined with --port."""
+        buckets_response = {
+            "aw-watcher-window_Host": {
+                "type": "currentwindow", "hostname": "Host", "client": "c",
+            },
+            "aw-watcher-afk_Host": {
+                "type": "afkstatus", "hostname": "Host", "client": "c",
+            },
+        }
+        mock_fetch.side_effect = [
+            buckets_response,
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        sys.argv = [
+            "aw-analysis.py", "--host", "messier4.lan", "--port", "5601",
+            "--start", "2026-02-28", "--end", "2026-02-28",
+        ]
+        aw.main()
+        out = capsys.readouterr().out
+        assert "messier4.lan:5601" in out
+
+
+# ── analyze_range ────────────────────────────────────────────────────
+
+
+class TestAnalyzeRange:
+    def _make_buckets_response(self):
+        return {
+            "aw-watcher-window_Host": {
+                "type": "currentwindow", "hostname": "Host", "client": "c",
+            },
+            "aw-watcher-afk_Host": {
+                "type": "afkstatus", "hostname": "Host", "client": "c",
+            },
+        }
+
+    @patch.object(aw, "fetch_json")
+    def test_returns_results_dict(self, mock_fetch):
+        mock_fetch.side_effect = [
+            self._make_buckets_response(),
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        result = aw.analyze_range("http://localhost:5600", ts(0), ts(23, 59, 59))
+        assert result is not None
+        assert "active_by_app" in result
+        assert "Code" in result["active_by_app"]
+
+    @patch.object(aw, "fetch_json")
+    def test_returns_none_no_events(self, mock_fetch):
+        mock_fetch.side_effect = [
+            self._make_buckets_response(),
+            [],  # no window events
+            [make_afk_event(ts(10), 3600)],
+        ]
+        result = aw.analyze_range("http://localhost:5600", ts(0), ts(23, 59, 59))
+        assert result is None
+
+    @patch.object(aw, "fetch_json")
+    def test_with_hostname(self, mock_fetch):
+        mock_fetch.side_effect = [
+            self._make_buckets_response(),
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        result = aw.analyze_range(
+            "http://localhost:5600", ts(0), ts(23, 59, 59), hostname="Host"
+        )
+        assert result is not None
+        assert result["hostname"] == "Host"
+
+    @patch.object(aw, "fetch_json")
+    def test_quiet_mode(self, mock_fetch, capsys):
+        mock_fetch.side_effect = [
+            self._make_buckets_response(),
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        aw.analyze_range(
+            "http://localhost:5600", ts(0), ts(23, 59, 59), quiet=True
+        )
+        out = capsys.readouterr().out
+        assert "Window events" not in out
+
+    @patch.object(aw, "fetch_json")
+    def test_verbose_mode(self, mock_fetch, capsys):
+        mock_fetch.side_effect = [
+            self._make_buckets_response(),
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        aw.analyze_range(
+            "http://localhost:5600", ts(0), ts(23, 59, 59), quiet=False
+        )
+        out = capsys.readouterr().out
+        assert "Window events" in out
+
+
+# ── pick_buckets_multi ───────────────────────────────────────────────
+
+
+class TestPickBucketsMulti:
+    def setup_method(self):
+        self.buckets = {
+            "currentwindow": [
+                {"id": "aw-watcher-window_Messier4.local", "hostname": "Messier4.local", "client": "c"},
+                {"id": "aw-watcher-window_messier4.lan", "hostname": "messier4.lan", "client": "c"},
+                {"id": "aw-watcher-window_garand.local", "hostname": "garand.local", "client": "c"},
+                {"id": "aw-watcher-window_Air4.local", "hostname": "Air4.local", "client": "c"},
+            ],
+        }
+
+    def test_matches_multiple_hostnames(self):
+        result = aw.pick_buckets_multi(
+            self.buckets, "currentwindow",
+            ["Messier4.local", "messier4.lan", "garand.local"]
+        )
+        assert len(result) == 3
+        assert "aw-watcher-window_Messier4.local" in result
+        assert "aw-watcher-window_messier4.lan" in result
+        assert "aw-watcher-window_garand.local" in result
+
+    def test_no_duplicates(self):
+        result = aw.pick_buckets_multi(
+            self.buckets, "currentwindow",
+            ["Messier4.local", "Messier4.local"]
+        )
+        assert len(result) == 1
+
+    def test_no_match_returns_empty(self):
+        result = aw.pick_buckets_multi(
+            self.buckets, "currentwindow", ["nonexistent"]
+        )
+        assert result == []
+
+    def test_empty_bucket_type(self):
+        result = aw.pick_buckets_multi(self.buckets, "afkstatus", ["Messier4.local"])
+        assert result == []
+
+    def test_excludes_non_matching(self):
+        result = aw.pick_buckets_multi(
+            self.buckets, "currentwindow",
+            ["Messier4.local", "garand.local"]
+        )
+        assert "aw-watcher-window_Air4.local" not in result
+
+
+# ── fetch_events_multi ───────────────────────────────────────────────
+
+
+class TestFetchEventsMulti:
+    @patch.object(aw, "fetch_events")
+    def test_merges_events(self, mock_fetch):
+        mock_fetch.side_effect = [
+            [{"event": 1}, {"event": 2}],
+            [{"event": 3}],
+        ]
+        result = aw.fetch_events_multi(
+            "http://localhost:5600", ["bucket1", "bucket2"], ts(0), ts(23)
+        )
+        assert len(result) == 3
+
+    @patch.object(aw, "fetch_events")
+    def test_empty_buckets(self, mock_fetch):
+        result = aw.fetch_events_multi(
+            "http://localhost:5600", [], ts(0), ts(23)
+        )
+        assert result == []
+
+    @patch.object(aw, "fetch_events")
+    def test_single_bucket(self, mock_fetch):
+        mock_fetch.return_value = [{"event": 1}]
+        result = aw.fetch_events_multi(
+            "http://localhost:5600", ["bucket1"], ts(0), ts(23)
+        )
+        assert len(result) == 1
+
+
+# ── multi-hostname via analyze_range ─────────────────────────────────
+
+
+class TestMultiHostname:
+    @patch.object(aw, "fetch_json")
+    def test_comma_separated_hostname(self, mock_fetch):
+        buckets = {
+            "aw-watcher-window_Messier4.local": {
+                "type": "currentwindow", "hostname": "Messier4.local", "client": "c",
+            },
+            "aw-watcher-window_garand.local": {
+                "type": "currentwindow", "hostname": "garand.local", "client": "c",
+            },
+            "aw-watcher-afk_Messier4.local": {
+                "type": "afkstatus", "hostname": "Messier4.local", "client": "c",
+            },
+            "aw-watcher-afk_garand.local": {
+                "type": "afkstatus", "hostname": "garand.local", "client": "c",
+            },
+        }
+        mock_fetch.side_effect = [
+            buckets,
+            # window events from 2 buckets
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_window_event(ts(11), 1800, "Firefox")],
+            # afk events from 2 buckets
+            [make_afk_event(ts(10), 7200)],
+            [make_afk_event(ts(10), 7200)],
+        ]
+        result = aw.analyze_range(
+            "http://localhost:5600", ts(0), ts(23, 59, 59),
+            hostname="Messier4.local,garand.local",
+        )
+        assert result is not None
+        assert "Code" in result["active_by_app"]
+        assert "Firefox" in result["active_by_app"]
+        assert result["hostname"] == "Messier4.local"
+
+    @patch.object(aw, "fetch_json")
+    def test_single_hostname_unchanged(self, mock_fetch):
+        buckets = {
+            "aw-watcher-window_Host": {
+                "type": "currentwindow", "hostname": "Host", "client": "c",
+            },
+            "aw-watcher-afk_Host": {
+                "type": "afkstatus", "hostname": "Host", "client": "c",
+            },
+        }
+        mock_fetch.side_effect = [
+            buckets,
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        result = aw.analyze_range(
+            "http://localhost:5600", ts(0), ts(23, 59, 59),
+            hostname="Host",
+        )
+        assert result is not None
+        assert result["hostname"] == "Host"
+
+    @patch.object(aw, "fetch_json")
+    def test_multi_hostname_no_match(self, mock_fetch):
+        buckets = {
+            "aw-watcher-window_Host": {
+                "type": "currentwindow", "hostname": "Host", "client": "c",
+            },
+            "aw-watcher-afk_Host": {
+                "type": "afkstatus", "hostname": "Host", "client": "c",
+            },
+        }
+        mock_fetch.return_value = buckets
+        result = aw.analyze_range(
+            "http://localhost:5600", ts(0), ts(23, 59, 59),
+            hostname="nonexistent1,nonexistent2",
+        )
+        assert result is None
+
+
+# ── merge_results ────────────────────────────────────────────────────
+
+
+class TestMergeResults:
+    def _make_result(self, hostname, active_secs, apps):
+        return {
+            "start": ts(0),
+            "end": ts(23, 59, 59),
+            "hostname": hostname,
+            "buckets_used": [f"aw-watcher-window_{hostname}"],
+            "afk_summary": {
+                "active_seconds": active_secs,
+                "afk_seconds": 1000,
+                "total_seconds": active_secs + 1000,
+                "active_ratio": active_secs / (active_secs + 1000),
+            },
+            "active_by_app": apps,
+            "browser_domains": {},
+            "editor_categories": {},
+            "editor_files": {},
+        }
+
+    def test_merge_two_devices(self):
+        r1 = self._make_result("Air4", 3600, {"Code": 2400, "Firefox": 1200})
+        r2 = self._make_result("Messier4", 1800, {"Code": 1200, "iTerm2": 600})
+        merged = aw.merge_results([r1, r2])
+        assert merged["hostname"] == "multi-device"
+        assert merged["active_by_app"]["Code"] == 3600
+        assert merged["active_by_app"]["Firefox"] == 1200
+        assert merged["active_by_app"]["iTerm2"] == 600
+        assert merged["afk_summary"]["active_seconds"] == 5400
+
+    def test_merge_preserves_devices_array(self):
+        r1 = self._make_result("Air4", 3600, {"Code": 3600})
+        r2 = self._make_result("Messier4", 1800, {"Code": 1800})
+        merged = aw.merge_results([r1, r2])
+        assert "devices" in merged
+        assert len(merged["devices"]) == 2
+        assert merged["devices"][0]["hostname"] == "Air4"
+        assert merged["devices"][1]["hostname"] == "Messier4"
+
+    def test_merge_empty_returns_none(self):
+        assert aw.merge_results([]) is None
+
+    def test_merge_single_device(self):
+        r1 = self._make_result("Air4", 3600, {"Code": 3600})
+        merged = aw.merge_results([r1])
+        assert merged["active_by_app"]["Code"] == 3600
+        assert len(merged["devices"]) == 1
+
+    def test_merge_browser_domains(self):
+        r1 = self._make_result("Air4", 3600, {})
+        r1["browser_domains"] = {"github.com": 100, "google.com": 50}
+        r2 = self._make_result("Messier4", 1800, {})
+        r2["browser_domains"] = {"github.com": 200, "reddit.com": 30}
+        merged = aw.merge_results([r1, r2])
+        assert merged["browser_domains"]["github.com"] == 300
+        assert merged["browser_domains"]["google.com"] == 50
+        assert merged["browser_domains"]["reddit.com"] == 30
+
+
+# ── --export-dir ─────────────────────────────────────────────────────
+
+
+class TestExportDir:
+    @patch.object(aw, "fetch_json")
+    def test_export_creates_files(self, mock_fetch, tmp_path):
+        buckets = {
+            "aw-watcher-window_Host": {
+                "type": "currentwindow", "hostname": "Host", "client": "c",
+            },
+            "aw-watcher-afk_Host": {
+                "type": "afkstatus", "hostname": "Host", "client": "c",
+            },
+        }
+        mock_fetch.side_effect = [
+            buckets,
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        export_dir = str(tmp_path / "export")
+        written = aw.export_days(
+            "http://localhost:5600",
+            ts(0), ts(23, 59, 59),
+            export_dir,
+        )
+        assert written == 1
+        filepath = tmp_path / "export" / "2026-02-28.json"
+        assert filepath.exists()
+        data = json.loads(filepath.read_text())
+        assert "active_by_app" in data
+        assert "Code" in data["active_by_app"]
+
+    @patch.object(aw, "fetch_json")
+    def test_export_skips_empty_days(self, mock_fetch, tmp_path):
+        buckets = {
+            "aw-watcher-window_Host": {
+                "type": "currentwindow", "hostname": "Host", "client": "c",
+            },
+            "aw-watcher-afk_Host": {
+                "type": "afkstatus", "hostname": "Host", "client": "c",
+            },
+        }
+        # Day 1: no data, Day 2: has data
+        mock_fetch.side_effect = [
+            # Day 1
+            buckets,
+            [],  # no window events
+            [make_afk_event(ts(10), 3600)],
+            # Day 2
+            buckets,
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        local_tz = timezone(timedelta(hours=0))
+        day1_start = datetime(2026, 2, 27, 0, 0, 0, tzinfo=local_tz)
+        day2_end = datetime(2026, 2, 28, 23, 59, 59, 999999, tzinfo=local_tz)
+        export_dir = str(tmp_path / "export")
+        written = aw.export_days(
+            "http://localhost:5600", day1_start, day2_end, export_dir,
+        )
+        assert written == 1
+        assert not (tmp_path / "export" / "2026-02-27.json").exists()
+        assert (tmp_path / "export" / "2026-02-28.json").exists()
+
+    @patch.object(aw, "fetch_json")
+    def test_export_json_format_matches_reference(self, mock_fetch, tmp_path):
+        """Exported JSON has the same top-level keys as reference format."""
+        buckets = {
+            "aw-watcher-window_Host": {
+                "type": "currentwindow", "hostname": "Host", "client": "c",
+            },
+            "aw-watcher-afk_Host": {
+                "type": "afkstatus", "hostname": "Host", "client": "c",
+            },
+        }
+        mock_fetch.side_effect = [
+            buckets,
+            [make_window_event(ts(10), 1800, "Firefox")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        export_dir = str(tmp_path / "export")
+        aw.export_days(
+            "http://localhost:5600", ts(0), ts(23, 59, 59), export_dir,
+        )
+        data = json.loads((tmp_path / "export" / "2026-02-28.json").read_text())
+        expected_keys = {
+            "start", "end", "hostname", "buckets_used", "afk_summary",
+            "active_by_app", "browser_domains", "editor_categories",
+            "editor_files",
+        }
+        assert set(data.keys()) == expected_keys
+
+    @patch.object(aw, "fetch_json")
+    def test_export_with_hostname(self, mock_fetch, tmp_path):
+        buckets = {
+            "aw-watcher-window_Custom": {
+                "type": "currentwindow", "hostname": "Custom", "client": "c",
+            },
+            "aw-watcher-afk_Custom": {
+                "type": "afkstatus", "hostname": "Custom", "client": "c",
+            },
+        }
+        mock_fetch.side_effect = [
+            buckets,
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        export_dir = str(tmp_path / "export")
+        aw.export_days(
+            "http://localhost:5600",
+            ts(0), ts(23, 59, 59),
+            export_dir,
+            hostname="Custom",
+        )
+        data = json.loads((tmp_path / "export" / "2026-02-28.json").read_text())
+        assert data["hostname"] == "Custom"
+
+    @patch.object(aw, "fetch_json")
+    def test_export_dir_requires_start_end(self, mock_fetch):
+        sys.argv = ["aw-analysis.py", "--export-dir", "/tmp/test"]
+        with pytest.raises(SystemExit) as exc_info:
+            aw.main()
+        assert exc_info.value.code == 2
+
+
+# ── --devices flag ───────────────────────────────────────────────────
+
+
+class TestDevicesFlag:
+    def _make_buckets(self, hostname):
+        return {
+            f"aw-watcher-window_{hostname}": {
+                "type": "currentwindow", "hostname": hostname, "client": "c",
+            },
+            f"aw-watcher-afk_{hostname}": {
+                "type": "afkstatus", "hostname": hostname, "client": "c",
+            },
+        }
+
+    @patch.object(aw, "fetch_json")
+    def test_devices_mutually_exclusive_with_host(self, mock_fetch):
+        sys.argv = [
+            "aw-analysis.py", "--devices", "a:5600,b:5601",
+            "--host", "custom",
+            "--start", "2026-02-28", "--end", "2026-02-28",
+        ]
+        with pytest.raises(SystemExit) as exc_info:
+            aw.main()
+        assert exc_info.value.code == 2
+
+    @patch.object(aw, "fetch_json")
+    def test_devices_two_servers_json(self, mock_fetch, capsys):
+        mock_fetch.side_effect = [
+            # Device 1
+            self._make_buckets("Air4"),
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+            # Device 2
+            self._make_buckets("Messier4"),
+            [make_window_event(ts(10), 900, "iTerm2")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        sys.argv = [
+            "aw-analysis.py", "--devices", "localhost:5600,localhost:5601",
+            "--start", "2026-02-28", "--end", "2026-02-28", "--json",
+        ]
+        aw.main()
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "devices" in data
+        assert len(data["devices"]) == 2
+        assert data["active_by_app"]["Code"] == 1800
+        assert data["active_by_app"]["iTerm2"] == 900
+
+    @patch.object(aw, "fetch_json")
+    def test_devices_human_output(self, mock_fetch, capsys):
+        mock_fetch.side_effect = [
+            self._make_buckets("Air4"),
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        sys.argv = [
+            "aw-analysis.py", "--devices", "localhost:5600",
+            "--start", "2026-02-28", "--end", "2026-02-28",
+        ]
+        aw.main()
+        out = capsys.readouterr().out
+        assert "ActivityWatch Analysis" in out
+
+    @patch.object(aw, "fetch_json")
+    def test_devices_one_failing(self, mock_fetch, capsys):
+        """One device fails, other succeeds — warning printed, data from good device."""
+        mock_fetch.side_effect = [
+            None,  # Device 1 fails → discover_buckets calls sys.exit(1)
+            self._make_buckets("Messier4"),
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        sys.argv = [
+            "aw-analysis.py", "--devices", "badhost:5600,localhost:5601",
+            "--start", "2026-02-28", "--end", "2026-02-28", "--json",
+        ]
+        aw.main()
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "Code" in data["active_by_app"]
+
+    @patch.object(aw, "fetch_json")
+    def test_devices_all_failing(self, mock_fetch, capsys):
+        """All devices fail — error reported."""
+        mock_fetch.return_value = None  # All fail
+        sys.argv = [
+            "aw-analysis.py", "--devices", "bad1:5600,bad2:5601",
+            "--start", "2026-02-28", "--end", "2026-02-28", "--json",
+        ]
+        with pytest.raises(SystemExit) as exc_info:
+            aw.main()
+        assert exc_info.value.code == 0
+
+    @patch.object(aw, "fetch_json")
+    def test_devices_no_data_from_server(self, mock_fetch, capsys):
+        """Server connects but has no events."""
+        mock_fetch.side_effect = [
+            self._make_buckets("Host"),
+            [],  # no window events
+            [make_afk_event(ts(10), 3600)],
+        ]
+        sys.argv = [
+            "aw-analysis.py", "--devices", "localhost:5600",
+            "--start", "2026-02-28", "--end", "2026-02-28", "--json",
+        ]
+        with pytest.raises(SystemExit) as exc_info:
+            aw.main()
+        assert exc_info.value.code == 0
+
+    @patch.object(aw, "fetch_json")
+    def test_devices_default_port(self, mock_fetch, capsys):
+        """Device spec without port defaults to 5600."""
+        mock_fetch.side_effect = [
+            self._make_buckets("Host"),
+            [make_window_event(ts(10), 1800, "Code")],
+            [make_afk_event(ts(10), 3600)],
+        ]
+        sys.argv = [
+            "aw-analysis.py", "--devices", "localhost",
+            "--start", "2026-02-28", "--end", "2026-02-28", "--json",
+        ]
+        aw.main()
+        out = capsys.readouterr().out
+        data = json.loads(out)
+        assert "Code" in data["active_by_app"]
